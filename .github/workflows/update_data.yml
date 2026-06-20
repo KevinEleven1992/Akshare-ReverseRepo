@@ -2,14 +2,18 @@ name: Daily OMO Data Update
 
 on:
   schedule:
-    # 每天北京时间上午 10:15 运行（央行通常在 9:20 左右公布公开市场操作结果）
-    # UTC 时间 02:15 等于北京时间 10:15
+    # 每天北京时间上午 10:15 运行
     - cron: '15 2 * * *'
-  workflow_dispatch: # 允许你手动随时点击触发更新
+  workflow_dispatch: # 允许手动触发
 
 jobs:
   update-data:
     runs-on: ubuntu-latest
+    
+    # ⭐⭐⭐ 主要是增加下面这两行权限声明 ⭐⭐⭐
+    permissions:
+      contents: write
+      
     steps:
     - name: 检出代码
       uses: actions/checkout@v3
@@ -32,5 +36,4 @@ jobs:
         git config --global user.name 'github-actions[bot]'
         git config --global user.email 'github-actions[bot]@users.noreply.github.com'
         git add data.json
-        # 只有在数据有变化时才提交，防止死循环
         git diff --quiet && git diff --staged --quiet || (git commit -m "自动更新央行数据" && git push)
