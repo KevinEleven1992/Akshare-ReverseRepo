@@ -4,140 +4,118 @@ import json
 import os
 import datetime
 
-def clean_financial_value(val):
-    """
-    清洗金融核心数值，剔除千分位逗号、特殊非数字字符，确保科学计算的正确性
-    """
+def clean_value(val):
+    """清洗央行数值，剔除千分位逗号、特殊非数字字符"""
     if pd.isna(val):
         return 0.0
-    val_str = str(val).replace(',', '').replace('亿元', '').strip()
-    if val_str in ['', '--', '-', '无', '非公开', 'None']:
+    s = str(val).replace(',', '').replace('亿元', '').strip()
+    if s in ['', '--', '-', '无', 'None']:
         return 0.0
     try:
-        return float(val_str)
+        return float(s)
     except:
         return 0.0
 
 def fetch_pboc_data():
-    print("开始从 AkShare 获取央行逆回购数据...")
+    print("开始从 AkShare 接口提取央行公开市场操作数据...")
+    result = []
+    
     try:
-        # 1. 抓取央行公开市场操作表
+        # 1. 抓取标准央行公开市场数据接口
         df = ak.macro_china_pboc_omo()
-        if df.empty:
-            print("错误：AkShare 未返回任何原始数据！")
-            return
-
-        # 2. 强力字段名匹配
-        date_col = next((c for c in df.columns if '日期' in c), '日期')
-        injection_col = next((c for c in df.columns if '逆回购' in c and ('操作' in c or '投放' in c) and '到期' not in c and '净' not in c), '逆回购-操作量')
-        maturity_col = next((c for c in df.columns if '逆回购' in c and '到期' in c), '逆回购-到期量')
-        net_col = next((c for c in df.columns if '逆回购' in c and '净' in c), '逆回购-净投放')
-
-        print(f"解析定位成功 -> 日期列: {date_col}, 投放列: {injection_col}, 到期列: {maturity_col}")
-
-        # 3. 基础类型转换与核心数据清洗
-        df[date_col] = pd.to_datetime(df[date_col], errors='coerce')
-        df = df.dropna(subset=[date_col])
         
-        df[injection_col] = df[injection_col].apply(clean_financial_value)
-        df[maturity_col] = df[maturity_col].apply(clean_financial_value)
-        if net_col in df.columns:
-            df[net_col] = df[net_col].apply(clean_financial_value)
+        if df is None or df.empty:
+            print("警告：AkShare 未返回任何数据，启动保底空数据机制。")
         else:
-            df[net_col] = df[injection_col] - df[maturity_col]
+            print("原始数据获取成功，开始校核字段...")
+            # 2. 精准定位逆回购专有数据列
+            date_col = next((c for c in df.columns if '日期' in c), '日期')
+            inj_col = next((c for c in df.columns if '逆回购' in c and ('操作' in c or '投放' in c) and '到期' not in c and '净' not in c), None)
+            mat_col = next((c for c in df.columns if '逆回购' in c and '到期' in c), None)
+            net_col = next((c for c in df.columns if '逆回购' in c and '净' in c), None)
 
-        # 4. 按日期从旧到新升序排列
-        df = df.sort_values(by=date_col, ascending=True)
+            # 如果动态匹配失败，强制使用官方标准字段名
+            if not inj_col or not mat_col:
+                inj_col = '逆回购-操作量'
+                mat_col = '逆回购-到期量'
+                net_col = '逆回购-净投放'
 
-        # 5. 准确定位今天的日期基准
-        today = datetime.date.today()
-        df_history = df[df[date_col].dt.date <= today]
-        if df_history.empty:
-            df_history = df  # 避免时区微调导致取空
+            # 3. 规范化清洗
+            df[date_col] = pd.to_datetime(df[date_col], errors='coerce')
+            df = df.dropna(subset=[date_col])
+            df[inj_col] = df[inj_col].apply(clean_value)
+            df[mat_col] = df[mat_col].apply(clean_value)
             
-        latest_hist_date = df_history[date_col].max().date()
+            # 严格按日期从旧到新升序排列
+            df = df.sort_values(by=date_col, ascending=True)
+            
+            # 4. 寻找最新有效数据日期作为科学计算的基准锚点
+            latest_record_date = df[date_col].max().date()
+            print(f"数据源最新有效操作日期为: {latest_record_date}")
 
-        # ==========================================
-        # 【要求一】：仅保留过去7天的历史操作量和到期量数据
-        # ==========================================
-        start_history_date = today - datetime.timedelta(days=7)
-        df_past_7 = df_history[df_history[date_col].dt.date >= start_history_date]
-        
-        # 容错：如果遇到连休长假导致过去7天全无数据，保底截取最后7个有记录的交易日
-        if len(df_past_7) < 2:
-            df_past_7 = df_history.tail(7)
-        
-        result = []
-        for _, row in df_past_7.iterrows():
-            date_str = row[date_col].strftime('%Y-%m-%d')
-            result.append({
-                "date": date_str,
-                "injection": row[injection_col],
-                "maturity": row[maturity_col],
-                "net": row[net_col],
-                "is_forecast": False
-            })
-
-        # ==========================================
-        # 【要求二】：科学计算，精确推演未来至少14天的到期量数据
-        # ==========================================
-        future_days = 14
-        future_records = {}
-        
-        # 预初始化未来14天连续的时间线
-        for i in range(1, future_days + 1):
-            f_date = latest_hist_date + datetime.timedelta(days=i)
-            f_date_str = f_date.strftime('%Y-%m-%d')
-            future_records[f_date_str] = {
-                "date": f_date_str,
-                "injection": 0.0,
-                "maturity": 0.0,
-                "net": 0.0,
-                "is_forecast": True
-            }
-
-        # 科学推演路径 1：远期合同公告穿透提取（针对已有远期行数据）
-        df_future_source = df[df[date_col].dt.date > latest_hist_date]
-        for _, row in df_future_source.iterrows():
-            f_date_str = row[date_col].strftime('%Y-%m-%d')
-            if f_date_str in future_records:
-                f_mat = row[maturity_col]
-                if f_mat > 0:
-                    future_records[f_date_str]["maturity"] = f_mat
-                    future_records[f_date_str]["net"] = -f_mat
-
-        # 科学推演路径 2：7天OMO刚性契约回溯投影（针对标准操作在未来回笼的刚性推算）
-        # 扫描过去14天内的投放，严格按7天周期向后映射到未来的到期日
-        df_past_14_for_forecast = df_history.tail(14)
-        for _, row in df_past_14_for_forecast.iterrows():
-            h_date = row[date_col].date()
-            inj_amt = row[injection_col]
-            if inj_amt > 0:
-                proj_date_7 = h_date + datetime.timedelta(days=7)
-                proj_date_7_str = proj_date_7.strftime('%Y-%m-%d')
+            # ==========================================
+            # 【要求一】：仅保留过去7天的历史操作量和到期量的数据
+            # ==========================================
+            # 获取最后7个有记录的交易日历史
+            df_past_7 = df.tail(7)
+            
+            for _, row in df_past_7.iterrows():
+                d_str = row[date_col].strftime('%Y-%m-%d')
+                injection = row[inj_col]
+                maturity = row[mat_col]
+                net = row[net_col] if net_col in df.columns else (injection - maturity)
                 
-                if proj_date_7_str in future_records:
-                    # 如果路径1中未登记到期量，则依照7天契约刚性归入
-                    if future_records[proj_date_7_str]["maturity"] == 0:
-                        future_records[proj_date_7_str]["maturity"] = inj_amt
-                        future_records[proj_date_7_str]["net"] = -inj_amt
+                result.append({
+                    "date": d_str,
+                    "injection": injection,
+                    "maturity": maturity,
+                    "net": clean_value(net),
+                    "is_forecast": False
+                })
 
-        # 合并处理完的未来14天科学计算行
-        for f_date_str in sorted(future_records.keys()):
-            result.append(future_records[f_date_str])
+            # ==========================================
+            # 【要求二】：科学计算，精确推演未来至少14天的到期量数据
+            # ==========================================
+            # 依据央行契约：T日的 7天期逆回购投放，将在 T+7 日刚性到期回回笼资金。
+            # 为了准确计算未来14天（D+1 到 D+14）的到期量，我们需要回溯 D-6 到 D+7 的历史投放。
+            future_records = {}
+            for i in range(1, 15):
+                f_date = latest_record_date + datetime.timedelta(days=i)
+                f_date_str = f_date.strftime('%Y-%m-%d')
+                future_records[f_date_str] = {
+                    "date": f_date_str,
+                    "injection": 0.0,
+                    "maturity": 0.0,
+                    "net": 0.0,
+                    "is_forecast": True
+                }
 
-        # 6. 保存并持久化输出
+            # 提取过去14天的历史投放，用于向未来推演投影
+            df_past_14 = df.tail(14)
+            for _, row in df_past_14.iterrows():
+                h_date = row[date_col].date()
+                inj_amt = row[inj_col]
+                if inj_amt > 0:
+                    # 按照 7天标准逆回购 刚性契约推算远期到期日
+                    proj_date = h_date + datetime.timedelta(days=7)
+                    proj_date_str = proj_date.strftime('%Y-%m-%d')
+                    
+                    if proj_date_str in future_records:
+                        future_records[proj_date_str]["maturity"] += inj_amt
+                        future_records[proj_date_str]["net"] = -future_records[proj_date_str]["maturity"]
+
+            # 将科学计算出的未来14天刚性到期行并入最终数据集
+            for f_date_str in sorted(future_records.keys()):
+                result.append(future_records[f_date_str])
+
+    except Exception as e:
+        print(f"解析过程中触发异常: {e}")
+    
+    finally:
+        # 保底机制：无论如何，必须保证 data.json 被成功写入，防止前端白屏
         with open('data.json', 'w', encoding='utf-8') as f:
             json.dump(result, f, ensure_ascii=False, indent=4)
-            
-        print(f"🎉 核心数据清洗完成！已成功写入 data.json。总共包含 {len(result)} 条安全的数据记录。")
-        
-    except Exception as e:
-        print(f"运行发生致命异常: {e}")
-        # 保底机制：如果完全崩溃，输出结构化数据防止前端白屏
-        if not os.path.exists('data.json'):
-            with open('data.json', 'w') as f:
-                json.dump([], f)
+        print(f"文件持久化保存成功，当前包含数据行数: {len(result)}")
 
 if __name__ == "__main__":
     fetch_pboc_data()
