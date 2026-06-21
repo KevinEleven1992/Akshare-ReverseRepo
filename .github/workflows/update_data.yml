@@ -3,7 +3,7 @@ name: Daily OMO Data Update
 on:
   schedule:
     # 每天北京时间上午 10:15 运行
-    - cron: '15 2 * * *'
+    - cron: '0 13 * * *'
   workflow_dispatch: # 允许手动触发
 
 jobs:
