@@ -2,24 +2,34 @@ name: Daily OMO Data Update
 
 on:
   schedule:
-    # 每天北京时间上午 10:15 运行
+    # 每天北京时间晚上 21:00 准时触发
     - cron: '0 13 * * *'
-  workflow_dispatch: # 允许手动触发
+  workflow_dispatch: # 保留手动触发按钮
+
+# 核心：必须开启写入内容和部署 Pages 的权限
+permissions:
+  contents: write
+  pages: write
+  id-token: write
+
+# 保证部署任务排队执行，不冲突
+concurrency:
+  group: "pages"
+  cancel-in-progress: false
 
 jobs:
-  update-data:
+  update-and-deploy:
+    environment:
+      name: github-pages
+      url: ${{ steps:deployment.outputs.page_url }}
     runs-on: ubuntu-latest
     
-    # ⭐⭐⭐ 主要是增加下面这两行权限声明 ⭐⭐⭐
-    permissions:
-      contents: write
-      
     steps:
     - name: 检出代码
-      uses: actions/checkout@v3
+      uses: actions/checkout@v4
 
     - name: 设置 Python 环境
-      uses: actions/setup-python@v4
+      uses: actions/setup-python@v5
       with:
         python-version: '3.10'
 
@@ -28,7 +38,7 @@ jobs:
         python -m pip install --upgrade pip
         pip install akshare pandas requests
 
-    - name: 执行抓取脚本
+    - name: 执行抓取与预测脚本
       run: python fetch_data.py
 
     - name: 提交并推送到仓库
@@ -36,4 +46,15 @@ jobs:
         git config --global user.name 'github-actions[bot]'
         git config --global user.email 'github-actions[bot]@users.noreply.github.com'
         git add data.json
-        git diff --quiet && git diff --staged --quiet || (git commit -m "自动更新央行数据" && git push)
+        git diff --quiet && git diff --staged --quiet || (git commit -m "自动更新央行历史与预测数据" && git push)
+
+    # ⭐ 新增步骤 1：打包并上传网页产物
+    - name: 上传网页产物
+      uses: actions/upload-pages-artifact@v3
+      with:
+        path: '.' # 整个根目录（含 index.html 和最新的 data.json）
+
+    # ⭐ 新增步骤 2：直接部署到 GitHub Pages
+    - name: 部署到 GitHub Pages
+      id: deployment
+      uses: actions/deploy-pages@v4
